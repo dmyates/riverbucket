@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "riverbucket",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-05-17",
+  "assets": {
+    "directory": "./dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "riverbucketdb",
+      "database_id": "YOUR_D1_DATABASE_ID"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "FEED_REFRESH_QUEUE",
+        "queue": "riverbucket-feed-refresh"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "riverbucket-feed-refresh",
+        "max_batch_size": 1,
+        "max_batch_timeout": 5
+      }
+    ]
+  },
+  "triggers": {
+    "crons": ["*/10 * * * *"]
+  }
+}

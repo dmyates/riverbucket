@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Riverbucket Options</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <div class="brand">
+        <img src="icons/icon-48.png" alt="" />
+        <h1>
+          <span class="river">River</span><span class="bucket">bucket</span>
+        </h1>
+      </div>
+      <label>
+        App URL
+        <input id="appUrl" placeholder="https://riverbucket.example.workers.dev" />
+      </label>
+      <label>
+        Extension token
+        <input id="token" type="password" />
+      </label>
+      <label>
+        Optional default tag
+        <input id="defaultTag" placeholder="later" />
+      </label>
+      <button id="save">Save</button>
+      <p id="status"></p>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

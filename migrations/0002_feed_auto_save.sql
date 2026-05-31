@@ -1,0 +1,1 @@
+ALTER TABLE feeds ADD COLUMN auto_save_to_bucket INTEGER NOT NULL DEFAULT 0;

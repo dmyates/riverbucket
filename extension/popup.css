@@ -1,0 +1,197 @@
+/* Riverbucket — extension popup
+   Mirrors the web app's warm sans-serif system at popup scale. */
+
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url("fonts/ibm-plex-sans-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: italic;
+  font-display: swap;
+  font-weight: 400;
+  src: url("fonts/ibm-plex-sans-latin-400-italic.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 500;
+  src: url("fonts/ibm-plex-sans-latin-500-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 600;
+  src: url("fonts/ibm-plex-sans-latin-600-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url("fonts/ibm-plex-mono-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 500;
+  src: url("fonts/ibm-plex-mono-latin-500-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Fraunces";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 700;
+  src: url("fonts/fraunces-latin-opsz-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Zilla Slab";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 600;
+  src: url("fonts/zilla-slab-latin-600-normal.woff2") format("woff2");
+}
+
+:root {
+  --font-body: "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  --font-title-river: "Fraunces", serif;
+  --font-title-bucket: "Zilla Slab", serif;
+
+  --bg: #f3e7d2;
+  --surface: #fff7ea;
+  --ink: #0b2230;
+  --muted: #4f6261;
+  --rule: #b9a98e;
+  --rule-strong: #7e8e8a;
+  --accent: #934615;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #071a24;
+    --surface: #0c2430;
+    --ink: #d8a15f;
+    --muted: #a9794f;
+    --rule: #25424e;
+    --rule-strong: #43616b;
+    --accent: #d47a2c;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-width: 300px;
+  color: var(--ink);
+  background: var(--bg);
+  font-family: var(--font-body);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+main {
+  padding: 16px 18px 18px;
+  display: grid;
+  gap: 12px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--rule-strong);
+}
+
+.brand img {
+  display: block;
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  flex: 0 0 auto;
+  filter: saturate(0.9);
+}
+
+h1 {
+  margin: 0;
+  font-size: 21px;
+  line-height: 1.05;
+  letter-spacing: 0;
+  text-transform: uppercase;
+  color: var(--ink);
+  display: flex;
+  align-items: baseline;
+}
+
+h1 .river {
+  font-family: var(--font-title-river);
+  font-weight: 700;
+}
+
+h1 .bucket {
+  font-family: var(--font-title-bucket);
+  font-weight: 600;
+  font-size: 1.05em;
+}
+
+p {
+  margin: 0;
+  color: var(--muted);
+  min-height: 18px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+button {
+  min-height: 36px;
+  border: 1px solid var(--rule-strong);
+  background: transparent;
+  color: var(--ink);
+  border-radius: 0;
+  padding: 0 12px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 100ms ease, color 100ms ease;
+}
+
+button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.links {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 6px;
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--rule);
+}
+
+.links button {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+  text-align: center;
+  color: var(--muted);
+  border-color: var(--rule);
+}
+
+.links button:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
