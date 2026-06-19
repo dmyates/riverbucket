@@ -15,6 +15,7 @@ Riverbucket is an app with two faces:
 - Browse recent feed items grouped by tag and source.
 - Save feed items to the bucket with one click.
 - Configure select feeds to automatically save new entries to the bucket.
+- Keep river, bucket, feeds, tags, refresh state, and extension-token metadata synchronized across open tabs and devices.
 - Import and export feeds via OPML and bookmarks via JSON/HTML.
 - Add sites to the river current site and pages to the bucket through the companion webextension.
 
@@ -59,6 +60,8 @@ Create the remote D1 database and feed refresh queue:
 npx wrangler d1 create riverbucketdb
 npx wrangler queues create riverbucket-feed-refresh
 ```
+
+The checked-in Wrangler configuration also provisions the `AppSync` Durable Object used for live synchronization when the Worker is deployed.
 
 Copy the D1 database ID from the `wrangler d1 create` output into `wrangler.jsonc` as `database_id`, or update the existing value if your checkout already has a config. If you change the database or queue names, update both `wrangler.jsonc` and the matching database name in the `db:migrate:*` scripts in `package.json`.
 
@@ -145,6 +148,15 @@ npm run db:migrate:remote
 ```
 
 The configured production D1 database name is `riverbucketdb`.
+
+## Contributions
+
+This project was vibe-coded (with love). As its creator, I reserve for myself the special and exclusive privilege of continued vibing. Outside contributors are held to stricter standards.
+
+1. **You must understand and be able to defend the code you're submitting.** A set of high-level matrix calculations cannot take responsibility, and "that's what the AI decided to do" is never a good enough explanation.
+2. **You must make all commits yourself with your own commit messages.** No Claude co-authoring: I reserve that right for myself.
+
+Of course, you are also welcome to fork this project and do whatever you want with it, subject to the license. But if you want to contribute upstream, please follow these two rules.
 
 ## License
 

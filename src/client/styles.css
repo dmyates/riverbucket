@@ -658,6 +658,17 @@ option {
   border-bottom-color: var(--accent);
 }
 
+.tagTabs button.dropReady {
+  color: var(--ink);
+  border-bottom-color: var(--rule-strong);
+}
+
+.tagTabs button.dropActive {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: color-mix(in srgb, var(--accent-pale) 45%, transparent);
+}
+
 /* -------- Lists -------- */
 
 .feedList,
@@ -720,6 +731,16 @@ option {
   align-items: start;
   padding-bottom: 22px;
   border-bottom: 1px solid var(--rule);
+  transition: opacity 120ms ease, border-color 120ms ease;
+}
+
+.riverFeed.dragging {
+  opacity: 0.55;
+  border-bottom-color: var(--accent);
+}
+
+.riverFeed.tagging {
+  opacity: 0.7;
 }
 
 .riverIcon {
@@ -769,6 +790,68 @@ option {
   bottom: -3px;
   height: 1px;
   background: var(--rule);
+}
+
+.riverDragHandle {
+  width: 18px;
+  min-width: 18px;
+  min-height: 20px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: grab;
+  opacity: 0.62;
+}
+
+.riverDragHandle:hover {
+  color: var(--accent);
+  opacity: 1;
+}
+
+.riverDragHandle:active {
+  cursor: grabbing;
+}
+
+.riverDragHandle:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+
+.riverDragPreview {
+  position: fixed;
+  top: -120px;
+  left: -120px;
+  z-index: 9999;
+  max-width: 260px;
+  display: grid;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid var(--accent);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 8px 20px rgb(0 0 0 / 0.18);
+  pointer-events: none;
+}
+
+.riverDragPreview strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.15;
+  font-weight: 600;
+}
+
+.riverDragPreview span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
 }
 
 .riverFeedTitle {
@@ -1160,6 +1243,8 @@ option {
 }
 
 .bookmark {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
   max-height: 900px;
   overflow: hidden;
   transform: translateX(0);
@@ -1178,6 +1263,11 @@ option {
 
 .bookmark--busy .actions {
   opacity: 0.55;
+}
+
+.bookmark .actions {
+  flex-wrap: nowrap;
+  justify-content: flex-end;
 }
 
 .bookmark--exiting {
@@ -1689,6 +1779,27 @@ a.icon {
   margin: 0;
 }
 
+.brandLoadingTitle {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0;
+  font-size: 28px;
+  line-height: 1.05;
+  font-weight: 600;
+}
+
+.brandLoadingTitle .river,
+.brandLoadingTitle .bucket {
+  color: var(--ink);
+  font-style: normal;
+  text-transform: uppercase;
+}
+
+.brandLoadingTitle .river {
+  margin-left: 0.28em;
+}
+
 .login form {
   width: min(440px, 100%);
   background: var(--surface);
@@ -1814,6 +1925,9 @@ a.icon {
   .feedBlock header,
   .row {
     display: grid;
+  }
+  .bookmark {
+    grid-template-columns: minmax(0, 1fr);
   }
   .actions {
     justify-content: flex-start;

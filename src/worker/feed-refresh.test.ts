@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dueFeedClaimOrderBy, selectFeedItemsForRefresh } from "./index";
+import { getDueFeedClaimOrderBy, selectFeedItemsForRefresh } from "./index";
 
 function item(id: string, publishedAt?: string) {
   return {
@@ -42,6 +42,8 @@ describe("selectFeedItemsForRefresh", () => {
 });
 
 describe("dueFeedClaimOrderBy", () => {
+  const dueFeedClaimOrderBy = getDueFeedClaimOrderBy();
+
   it("prioritizes never-fetched feeds first", () => {
     expect(dueFeedClaimOrderBy).toContain("last_fetched_at IS NULL DESC");
   });

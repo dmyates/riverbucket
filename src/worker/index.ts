@@ -6,8 +6,16 @@ type Env = {
   DB: D1Database;
   ASSETS: Fetcher;
   FEED_REFRESH_QUEUE?: Queue<FeedRefreshMessage>;
+  APP_SYNC: DurableObjectNamespace;
   APP_PASSWORD_HASH?: string;
   SESSION_SECRET?: string;
+};
+
+type AppSyncScope = "river" | "bucket" | "feeds" | "feedTags" | "tags" | "extensionTokens";
+
+type AppInvalidationEvent = {
+  type: "app.invalidate";
+  scopes: AppSyncScope[];
 };
 
 type FeedRefreshMessage = {
@@ -149,7 +157,7 @@ const dueFeedRefreshWhere = `is_active = 1
        AND (last_fetched_at IS NULL OR datetime(last_fetched_at, '+' || fetch_interval_minutes || ' minutes') <= datetime('now'))`;
 const claimableDueFeedRefreshWhere = `${dueFeedRefreshWhere}
        AND (refresh_claimed_at IS NULL OR datetime(refresh_claimed_at, '+${refreshClaimTtlMinutes} minutes') <= datetime('now'))`;
-export const dueFeedClaimOrderBy = `last_fetched_at IS NULL DESC,
+const dueFeedClaimOrderBy = `last_fetched_at IS NULL DESC,
      CASE
        WHEN last_fetched_at IS NOT NULL
         AND datetime(last_fetched_at, '+' || (fetch_interval_minutes * 2) || ' minutes') <= datetime('now')
@@ -165,6 +173,10 @@ export const dueFeedClaimOrderBy = `last_fetched_at IS NULL DESC,
      latest.latest_item_time IS NULL ASC,
      latest.latest_item_time DESC,
      COALESCE(last_fetched_at, created_at) ASC`;
+
+export function getDueFeedClaimOrderBy(): string {
+  return dueFeedClaimOrderBy;
+}
 
 type RefreshBatchResult = {
   refreshed: number;
@@ -233,6 +245,61 @@ export default {
   }
 };
 
+export class AppSync {
+  constructor(private readonly state: DurableObjectState) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/connect") {
+      if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+        return json({ error: "WebSocket upgrade required" }, 426);
+      }
+      const clientId = request.headers.get("x-riverbucket-client-id") || "";
+      if (!validClientId(clientId)) return json({ error: "Invalid client ID" }, 400);
+
+      const pair = new WebSocketPair();
+      const client = pair[0];
+      const server = pair[1];
+      this.state.acceptWebSocket(server);
+      server.serializeAttachment({ clientId });
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    if (request.method === "POST" && url.pathname === "/publish") {
+      const event = await readJson<AppInvalidationEvent & { sourceClientId?: string }>(request);
+      if (event.type !== "app.invalidate" || !Array.isArray(event.scopes)) {
+        return json({ error: "Invalid event" }, 400);
+      }
+      const scopes = normalizeAppSyncScopes(event.scopes);
+      if (scopes.length === 0) return json({ ok: true, delivered: 0 });
+
+      const payload = JSON.stringify({ type: "app.invalidate", scopes } satisfies AppInvalidationEvent);
+      let delivered = 0;
+      for (const socket of this.state.getWebSockets()) {
+        const attachment = socket.deserializeAttachment() as { clientId?: string } | null;
+        if (event.sourceClientId && attachment?.clientId === event.sourceClientId) continue;
+        try {
+          socket.send(payload);
+          delivered += 1;
+        } catch {
+          try {
+            socket.close(1011, "Delivery failed");
+          } catch {
+            // The socket is already closed.
+          }
+        }
+      }
+      return json({ ok: true, delivered });
+    }
+
+    return json({ error: "Not found" }, 404);
+  }
+
+  webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): void {
+    if (message === "ping") socket.send("pong");
+  }
+}
+
 async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   const method = request.method.toUpperCase();
@@ -256,6 +323,7 @@ async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Pro
 
   if (method === "GET" && path === "/api/me") return json({ authenticated: true });
   if (method === "GET" && path === "/api/startup/river") return startupRiver(request, env, ctx);
+  if (method === "GET" && path === "/api/app/live") return openAppSyncSocket(request, env);
   if (method === "POST" && path === "/api/logout") return logout(request);
 
   if (method === "GET" && path === "/api/feeds") return listFeeds(env);
@@ -267,32 +335,32 @@ async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Pro
   if (method === "POST" && path === "/api/feeds/bulk-tags") return bulkTagFeeds(request, env);
 
   const feedRefresh = path.match(/^\/api\/feeds\/([^/]+)\/refresh$/);
-  if (feedRefresh && method === "POST") return refreshFeedEndpoint(env, feedRefresh[1]);
+  if (feedRefresh && method === "POST") return refreshFeedEndpoint(request, env, feedRefresh[1]);
 
   const feedMatch = path.match(/^\/api\/feeds\/([^/]+)$/);
   if (feedMatch && method === "PATCH") return updateFeed(request, env, feedMatch[1]);
-  if (feedMatch && method === "DELETE") return deleteFeed(env, feedMatch[1]);
+  if (feedMatch && method === "DELETE") return deleteFeed(request, env, feedMatch[1]);
 
   if (method === "GET" && path === "/api/river") return getRiver(request, env);
 
   const saveItemMatch = path.match(/^\/api\/feed-items\/([^/]+)\/save$/);
-  if (saveItemMatch && method === "POST") return saveFeedItem(env, saveItemMatch[1]);
+  if (saveItemMatch && method === "POST") return saveFeedItem(request, env, saveItemMatch[1]);
 
   if (method === "GET" && path === "/api/bookmarks") return listBookmarks(request, env);
   if (method === "POST" && path === "/api/bookmarks") return upsertBookmarkEndpoint(request, env, "manual");
 
   const bookmarkArchive = path.match(/^\/api\/bookmarks\/([^/]+)\/archive$/);
-  if (bookmarkArchive && method === "POST") return archiveBookmark(env, bookmarkArchive[1]);
+  if (bookmarkArchive && method === "POST") return archiveBookmark(request, env, bookmarkArchive[1]);
 
   const bookmarkRestore = path.match(/^\/api\/bookmarks\/([^/]+)\/restore$/);
-  if (bookmarkRestore && method === "POST") return restoreBookmark(env, bookmarkRestore[1]);
+  if (bookmarkRestore && method === "POST") return restoreBookmark(request, env, bookmarkRestore[1]);
 
   const bookmarkTag = path.match(/^\/api\/bookmarks\/([^/]+)\/tags$/);
   if (bookmarkTag && method === "POST") return setBookmarkTagsEndpoint(request, env, bookmarkTag[1]);
 
   const bookmarkMatch = path.match(/^\/api\/bookmarks\/([^/]+)$/);
   if (bookmarkMatch && method === "PATCH") return updateBookmark(request, env, bookmarkMatch[1]);
-  if (bookmarkMatch && method === "DELETE") return deleteBookmark(env, bookmarkMatch[1]);
+  if (bookmarkMatch && method === "DELETE") return deleteBookmark(request, env, bookmarkMatch[1]);
 
   if (method === "GET" && path === "/api/tags") return listTags(env);
   if (method === "POST" && path === "/api/tags") return createTagEndpoint(request, env);
@@ -309,7 +377,7 @@ async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Pro
   if (method === "GET" && path === "/api/extension-tokens") return listExtensionTokens(env);
   if (method === "POST" && path === "/api/extension-tokens") return createExtensionToken(request, env);
   const tokenRevoke = path.match(/^\/api\/extension-tokens\/([^/]+)\/revoke$/);
-  if (tokenRevoke && method === "POST") return revokeExtensionToken(env, tokenRevoke[1]);
+  if (tokenRevoke && method === "POST") return revokeExtensionToken(request, env, tokenRevoke[1]);
 
   if (method === "POST" && path === "/api/extension/save-link") return saveExtensionLink(request, env);
   if (method === "POST" && path === "/api/extension/subscribe") return extensionSubscribe(request, env);
@@ -343,6 +411,25 @@ function logout(request: Request): Response {
   });
 }
 
+async function openAppSyncSocket(request: Request, env: Env): Promise<Response> {
+  if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+    return json({ error: "WebSocket upgrade required" }, 426);
+  }
+  const origin = request.headers.get("origin");
+  if (origin && origin !== new URL(request.url).origin) {
+    return json({ error: "Cross-site request rejected" }, 403);
+  }
+  const clientId = new URL(request.url).searchParams.get("clientId") || "";
+  if (!validClientId(clientId)) return json({ error: "Invalid client ID" }, 400);
+
+  return env.APP_SYNC.getByName("app").fetch("https://app-sync/connect", {
+    headers: {
+      upgrade: "websocket",
+      "x-riverbucket-client-id": clientId
+    }
+  });
+}
+
 async function requireSession(request: Request, env: Env): Promise<true | Response> {
   const cookie = parseCookies(request.headers.get("cookie") || "")[sessionCookie];
   if (!cookie) return json({ error: "Authentication required" }, 401);
@@ -372,6 +459,7 @@ async function requireExtensionToken(request: Request, env: Env): Promise<true |
   if (!row) return json({ error: "Invalid extension token" }, 401);
   if (!row.last_used_at || Date.now() - new Date(row.last_used_at).getTime() > 60 * 60 * 1000) {
     await env.DB.prepare("UPDATE extension_tokens SET last_used_at = ? WHERE id = ?").bind(now(), row.id).run();
+    await publishAppInvalidation(env, ["extensionTokens"]);
   }
   return true;
 }
@@ -477,6 +565,7 @@ async function createFeed(request: Request, env: Env): Promise<Response> {
     feed.tags = [];
   }
 
+  await publishAppInvalidation(env, ["river", "feeds", "feedTags"], request);
   return json({ feed }, 201);
 }
 
@@ -502,11 +591,13 @@ async function updateFeed(request: Request, env: Env, id: string): Promise<Respo
   if (body.tags) await setFeedTags(env, id, body.tags);
   const feed = await env.DB.prepare("SELECT * FROM feeds WHERE id = ?").bind(id).first<Feed>();
   if (feed) feed.tags = await getFeedTags(env, id);
+  await publishAppInvalidation(env, ["river", "feeds", "feedTags"], request);
   return json({ feed });
 }
 
-async function deleteFeed(env: Env, id: string): Promise<Response> {
+async function deleteFeed(request: Request, env: Env, id: string): Promise<Response> {
   await env.DB.prepare("DELETE FROM feeds WHERE id = ?").bind(id).run();
+  await publishAppInvalidation(env, ["river", "feeds", "feedTags"], request);
   return json({ ok: true });
 }
 
@@ -521,6 +612,7 @@ async function bulkDeleteFeeds(request: Request, env: Env): Promise<Response> {
     await env.DB.prepare(`DELETE FROM feeds WHERE id IN (${placeholders})`).bind(...ids).run();
   }
 
+  if (existingIds.length > 0) await publishAppInvalidation(env, ["river", "feeds", "feedTags"], request);
   return json({ ok: true, deleted: existingIds.length });
 }
 
@@ -546,19 +638,20 @@ async function bulkTagFeeds(request: Request, env: Env): Promise<Response> {
     ));
   }
 
+  await publishAppInvalidation(env, ["river", "feeds", "feedTags"], request);
   return json({ ok: true, updated: existingIds.length });
 }
 
-async function refreshFeedEndpoint(env: Env, id: string): Promise<Response> {
+async function refreshFeedEndpoint(request: Request, env: Env, id: string): Promise<Response> {
   const feed = await env.DB.prepare("SELECT * FROM feeds WHERE id = ?").bind(id).first<Feed>();
   if (!feed) return json({ error: "Feed not found" }, 404);
-  const result = await refreshOneFeed(env, feed);
+  const result = await refreshOneFeed(env, feed, request);
   return json(result);
 }
 
 async function refreshFeedBatchEndpoint(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const body = await readJson<{ feedIds?: string[]; limit?: number; async?: boolean }>(request);
-  if (body.async) return json(await queueRefreshBatch(env, ctx, body.feedIds));
+  if (body.async) return json(await queueRefreshBatch(env, ctx, body.feedIds, request));
 
   const limit = Math.max(1, Math.min(maxRefreshBatchSize, Number(body.limit) || maxRefreshBatchSize));
   let feeds: Feed[] = [];
@@ -581,14 +674,14 @@ async function refreshFeedBatchEndpoint(request: Request, env: Env, ctx: Executi
   for (const message of claimedMessages) {
     const feed = await env.DB.prepare("SELECT * FROM feeds WHERE id = ? AND is_active = 1").bind(message.feedId).first<Feed>();
     if (!feed || feed.refresh_claim_id !== message.claimId) continue;
-    const refresh = await refreshOneFeed(env, feed);
+    const refresh = await refreshOneFeed(env, feed, request);
     result.refreshed++;
     if (refresh.ok) result.inserted += refresh.inserted || 0;
     else result.failed++;
     result.results.push({ feedId: feed.id, ...refresh });
   }
   for (const feed of feeds) {
-    const refresh = await refreshOneFeed(env, feed);
+    const refresh = await refreshOneFeed(env, feed, request);
     result.refreshed++;
     if (refresh.ok) result.inserted += refresh.inserted || 0;
     else result.failed++;
@@ -600,13 +693,15 @@ async function refreshFeedBatchEndpoint(request: Request, env: Env, ctx: Executi
 async function queueRefreshBatch(
   env: Env,
   ctx: ExecutionContext,
-  feedIds: unknown
+  feedIds: unknown,
+  request?: Request
 ): Promise<RefreshQueueResult> {
   const ids = Array.isArray(feedIds) ? uniqueStrings(feedIds) : [];
   if (ids.length === 0) return { queued: 0, skipped: 0, total: 0 };
 
   const messages = await claimFeedIdsForRefresh(env, ids);
   await enqueueRefreshMessages(env, ctx, messages);
+  if (messages.length > 0) await publishAppInvalidation(env, ["river", "feeds"], request);
   return { queued: messages.length, skipped: ids.length - messages.length, total: ids.length };
 }
 
@@ -729,7 +824,7 @@ function encodeCursor(savedAt: string, id: string): string {
   return btoaUrl(JSON.stringify({ saved_at: savedAt, id }));
 }
 
-async function saveFeedItem(env: Env, itemId: string): Promise<Response> {
+async function saveFeedItem(request: Request, env: Env, itemId: string): Promise<Response> {
   const item = await env.DB.prepare("SELECT * FROM feed_items WHERE id = ?").bind(itemId).first<FeedItem>();
   if (!item) return json({ error: "Feed item not found" }, 404);
   const result = await upsertBookmark(env, {
@@ -742,6 +837,7 @@ async function saveFeedItem(env: Env, itemId: string): Promise<Response> {
   });
   if (result.created) await mergeBookmarkTags(env, result.bookmark.id, ["river"]);
   result.bookmark.tags = await getBookmarkTags(env, result.bookmark.id);
+  await publishAppInvalidation(env, ["river", "bucket", "tags"], request);
   return json(bookmarkSaveResponse(result));
 }
 
@@ -806,6 +902,7 @@ async function upsertBookmarkEndpoint(request: Request, env: Env, defaultSource:
   });
   if (body.tags) await setBookmarkTags(env, result.bookmark.id, body.tags);
   result.bookmark.tags = await getBookmarkTags(env, result.bookmark.id);
+  await publishAppInvalidation(env, ["river", "bucket", "tags"], request);
   return json(bookmarkSaveResponse(result));
 }
 
@@ -826,26 +923,30 @@ async function updateBookmark(request: Request, env: Env, id: string): Promise<R
   if (body.tags) await setBookmarkTags(env, id, body.tags);
   const bookmark = await env.DB.prepare("SELECT * FROM bookmarks WHERE id = ?").bind(id).first<Bookmark>();
   if (bookmark) bookmark.tags = await getBookmarkTags(env, id);
+  await publishAppInvalidation(env, ["river", "bucket", "tags"], request);
   return json({ bookmark });
 }
 
-async function archiveBookmark(env: Env, id: string): Promise<Response> {
+async function archiveBookmark(request: Request, env: Env, id: string): Promise<Response> {
   await env.DB.prepare("UPDATE bookmarks SET status = 'archived', archived_at = ?, updated_at = ? WHERE id = ?")
     .bind(now(), now(), id)
     .run();
+  await publishAppInvalidation(env, ["bucket", "tags"], request);
   return json({ ok: true });
 }
 
-async function restoreBookmark(env: Env, id: string): Promise<Response> {
+async function restoreBookmark(request: Request, env: Env, id: string): Promise<Response> {
   await env.DB.prepare("UPDATE bookmarks SET status = 'bucket', archived_at = NULL, updated_at = ? WHERE id = ?")
     .bind(now(), id)
     .run();
+  await publishAppInvalidation(env, ["bucket", "tags"], request);
   return json({ ok: true });
 }
 
-async function deleteBookmark(env: Env, id: string): Promise<Response> {
+async function deleteBookmark(request: Request, env: Env, id: string): Promise<Response> {
   await env.DB.prepare("DELETE FROM bookmark_tags WHERE bookmark_id = ?").bind(id).run();
   await env.DB.prepare("DELETE FROM bookmarks WHERE id = ?").bind(id).run();
+  await publishAppInvalidation(env, ["river", "bucket", "tags"], request);
   return json({ ok: true });
 }
 
@@ -862,12 +963,14 @@ async function createTagEndpoint(request: Request, env: Env): Promise<Response> 
   const body = await readJson<{ name?: string }>(request);
   if (!body.name) return json({ error: "Tag name required" }, 400);
   const tag = await ensureTag(env, body.name);
+  await publishAppInvalidation(env, ["tags"], request);
   return json({ tag }, 201);
 }
 
 async function setBookmarkTagsEndpoint(request: Request, env: Env, id: string): Promise<Response> {
   const body = await readJson<{ tags?: string[] }>(request);
   await setBookmarkTags(env, id, body.tags || []);
+  await publishAppInvalidation(env, ["bucket", "tags"], request);
   return json({ tags: await getBookmarkTags(env, id) });
 }
 
@@ -877,6 +980,7 @@ async function importOpml(request: Request, env: Env): Promise<Response> {
   const parsed = xmlParser.parse(body.opml) as Record<string, unknown>;
   const outlines = collectOutlines(parsed);
   const result = await importFeedBatch(env, outlines);
+  if (result.imported > 0) await publishAppInvalidation(env, ["river", "feeds", "feedTags"], request);
   return json(result);
 }
 
@@ -884,6 +988,7 @@ async function importOpmlFeeds(request: Request, env: Env): Promise<Response> {
   const body = await readJson<{ feeds?: ImportFeedInput[] }>(request);
   if (!Array.isArray(body.feeds)) return json({ error: "Feeds array required" }, 400);
   const result = await importFeedBatch(env, body.feeds);
+  if (result.imported > 0) await publishAppInvalidation(env, ["river", "feeds", "feedTags"], request);
   return json(result);
 }
 
@@ -909,6 +1014,9 @@ async function importBookmarks(request: Request, env: Env): Promise<Response> {
     }
   }
 
+  if (result.imported + result.skipped > 0) {
+    await publishAppInvalidation(env, ["river", "bucket", "tags"], request);
+  }
   return json(result);
 }
 
@@ -944,6 +1052,9 @@ async function importAllJson(request: Request, env: Env): Promise<Response> {
   await importBundleBookmarkTags(env, bundle.bookmark_tags, result.bookmark_tags, bookmarkIds, tagIds);
   await importBundleFeedTags(env, bundle.feed_tags, result.feed_tags, feedIds, tagIds);
 
+  if (Object.values(result).some((summary) => summary.imported > 0)) {
+    await publishAppInvalidation(env, ["river", "bucket", "feeds", "feedTags", "tags"], request);
+  }
   return json(result);
 }
 
@@ -1412,11 +1523,13 @@ async function createExtensionToken(request: Request, env: Env): Promise<Respons
   await env.DB.prepare(
     "INSERT INTO extension_tokens (id, token_hash, label, created_at) VALUES (?, ?, ?, ?)"
   ).bind(id, await sha256(token), body.label || "Extension", now()).run();
+  await publishAppInvalidation(env, ["extensionTokens"], request);
   return json({ token: { id, label: body.label || "Extension", created_at: now() }, secret: token }, 201);
 }
 
-async function revokeExtensionToken(env: Env, id: string): Promise<Response> {
+async function revokeExtensionToken(request: Request, env: Env, id: string): Promise<Response> {
   await env.DB.prepare("UPDATE extension_tokens SET revoked_at = ? WHERE id = ?").bind(now(), id).run();
+  await publishAppInvalidation(env, ["extensionTokens"], request);
   return json({ ok: true });
 }
 
@@ -1434,6 +1547,7 @@ async function saveExtensionLink(request: Request, env: Env): Promise<Response> 
   });
   if (body.tags) await setBookmarkTags(env, result.bookmark.id, body.tags);
   result.bookmark.tags = await getBookmarkTags(env, result.bookmark.id);
+  await publishAppInvalidation(env, ["river", "bucket", "tags"]);
   return json(bookmarkSaveResponse(result));
 }
 
@@ -1450,6 +1564,7 @@ async function enqueueDueFeeds(env: Env, limit: number): Promise<number> {
   const claimLimit = env.FEED_REFRESH_QUEUE ? limit : Math.min(limit, maxRefreshBatchSize);
   const messages = await claimDueFeeds(env, claimLimit);
   if (messages.length === 0) return 0;
+  await publishAppInvalidation(env, ["river", "feeds"]);
 
   if (env.FEED_REFRESH_QUEUE) {
     await env.FEED_REFRESH_QUEUE.sendBatch(messages.map((message) => ({ body: message })));
@@ -1496,7 +1611,11 @@ async function processFeedRefreshMessage(env: Env, message: FeedRefreshMessage):
   await refreshOneFeed(env, feed);
 }
 
-async function refreshOneFeed(env: Env, feed: Feed): Promise<{ ok: boolean; inserted?: number; error?: string }> {
+async function refreshOneFeed(
+  env: Env,
+  feed: Feed,
+  request?: Request
+): Promise<{ ok: boolean; inserted?: number; error?: string }> {
   try {
     const parsed = await fetchAndParseFeed(feed.feed_url);
     let inserted = 0;
@@ -1521,12 +1640,14 @@ async function refreshOneFeed(env: Env, feed: Feed): Promise<{ ok: boolean; inse
     await env.DB.prepare(
       "UPDATE feeds SET title = ?, description = ?, site_url = COALESCE(?, site_url), favicon_url = COALESCE(favicon_url, ?), last_fetched_at = ?, last_success_at = ?, last_error = NULL, refresh_claimed_at = NULL, refresh_claim_id = NULL, updated_at = ? WHERE id = ?"
     ).bind(parsed.title || feed.title, parsed.description || feed.description, parsed.siteUrl || null, faviconUrl, now(), now(), now(), feed.id).run();
+    await publishAppInvalidation(env, ["river", "feeds", "bucket", "tags"], request);
     return { ok: true, inserted };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Refresh failed";
     await env.DB.prepare("UPDATE feeds SET last_fetched_at = ?, last_error = ?, refresh_claimed_at = NULL, refresh_claim_id = NULL, updated_at = ? WHERE id = ?")
       .bind(now(), message, now(), feed.id)
       .run();
+    await publishAppInvalidation(env, ["river", "feeds"], request);
     return { ok: false, error: message };
   }
 }
@@ -2545,6 +2666,40 @@ function requireSameOriginForMutation(request: Request): true | Response {
   if (!origin) return true;
   if (origin !== new URL(request.url).origin) return json({ error: "Cross-site request rejected" }, 403);
   return true;
+}
+
+async function publishAppInvalidation(
+  env: Env,
+  scopes: AppSyncScope[],
+  request?: Request
+): Promise<void> {
+  const normalized = normalizeAppSyncScopes(scopes);
+  if (normalized.length === 0) return;
+  const sourceClientId = request?.headers.get("x-riverbucket-client-id") || undefined;
+  try {
+    await env.APP_SYNC.getByName("app").fetch("https://app-sync/publish", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        type: "app.invalidate",
+        scopes: normalized,
+        ...(validClientId(sourceClientId || "") ? { sourceClientId } : {})
+      })
+    });
+  } catch (error) {
+    console.error("App sync publish failed", error);
+  }
+}
+
+function normalizeAppSyncScopes(scopes: unknown[]): AppSyncScope[] {
+  const allowed = new Set<AppSyncScope>(["river", "bucket", "feeds", "feedTags", "tags", "extensionTokens"]);
+  return Array.from(new Set(scopes.filter((scope): scope is AppSyncScope =>
+    typeof scope === "string" && allowed.has(scope as AppSyncScope)
+  )));
+}
+
+function validClientId(value: string): boolean {
+  return /^[A-Za-z0-9_-]{8,128}$/.test(value);
 }
 
 function sessionSecret(request: Request, env: Env): string | null {

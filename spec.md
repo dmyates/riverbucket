@@ -26,7 +26,7 @@ The app should do almost nothing automatically beyond fetching feeds. Saving to 
 
 Use **Cloudflare Workers** as the app host/API layer, with a static frontend served by the same Worker or Cloudflare’s frontend tooling. Use **D1** for relational storage, because the app has structured data and needs joins between feeds, feed items, saved bookmarks, tags, and extension tokens. Cloudflare Cron Triggers can run a Worker `scheduled()` handler to refresh feeds periodically. ([Cloudflare Docs][4])
 
-Avoid Durable Objects in v1 unless you later need coordination, live sync, or multi-user collaboration. Cloudflare describes Durable Objects as useful for stateful coordination among clients; this app mostly needs periodic fetches and simple CRUD. ([Cloudflare Docs][5])
+Use one hibernating Durable Object per deployment to coordinate live invalidation events across tabs and devices. D1 remains the source of truth; clients refetch only the affected active view after receiving an event. ([Cloudflare Docs][5])
 
 Suggested stack:
 
@@ -575,7 +575,7 @@ Infrastructure:
   Cloudflare Worker
   D1
   Cron Trigger
-  no Durable Objects
+  one Durable Object for app-wide live synchronization
   no Queues unless refreshes become unreliable
 ```
 

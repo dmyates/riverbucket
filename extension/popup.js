@@ -20,6 +20,7 @@ document.querySelector("#subscribe").addEventListener("click", async () => {
   try {
     await extensionApi("/api/extension/subscribe", payload);
     setStatus(feed ? `Subscribed to ${feed.title}` : "Subscription added");
+    closePopup();
   } catch (error) {
     setStatus(error instanceof Error ? error.message : "Request failed");
   }
@@ -34,7 +35,8 @@ async function saveLinkFromPopup(payload) {
     const result = await saveLink(payload);
     const tab = await currentTab();
     await showSaveToast(tab.id, result);
-    setStatus(result.created ? "Saved" : "Already saved");
+    setStatus(result.created ? "Saved" : "Resaved");
+    closePopup();
   } catch (error) {
     setStatus(error instanceof Error ? error.message : "Save failed");
   }
@@ -59,4 +61,8 @@ async function openApp(path) {
 
 function setStatus(text) {
   statusNode.textContent = text;
+}
+
+function closePopup() {
+  window.close();
 }

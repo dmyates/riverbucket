@@ -57,7 +57,7 @@ export async function showSaveToast(tabId, result) {
   await showToast(tabId, {
     kind: result.created ? "success" : "duplicate",
     title: "Riverbucket",
-    text: result.created ? "Added to bucket" : "Already in bucket"
+    text: result.created ? "Added to bucket" : "Resaved to bucket"
   });
 }
 

@@ -4,6 +4,7 @@ import {
   Archive,
   ArchiveRestore,
   Check,
+  GripVertical,
   History,
   KeyRound,
   PaintBucket,
@@ -153,6 +154,9 @@ type RiverResponse = {
   tags: FeedTag[];
 };
 
+type AppSyncScope = "river" | "bucket" | "feeds" | "feedTags" | "tags" | "extensionTokens";
+type AppInvalidationEvent = { type: "app.invalidate"; scopes: AppSyncScope[] };
+
 type StartupRiverResponse = {
   authenticated: true;
   river: RiverResponse;
@@ -175,6 +179,7 @@ type Tab = (typeof tabs)[number];
 type RiverSort = "newest" | "title";
 type BucketStatus = "bucket" | "archived";
 type BucketRowAction = "busy" | "exiting";
+type RiverDropTarget = { kind: "tag"; name: string } | { kind: "untagged" };
 type Route =
   | { view: "river"; tag: string; sort: RiverSort }
   | { view: "bucket"; status: BucketStatus; tag: string; query: string; page: number }
@@ -210,12 +215,172 @@ const TAGLINES = [
   "Not that type of bucket list."
 ];
 
+const appInvalidationEventName = "riverbucket:invalidate";
+const allAppSyncScopes: AppSyncScope[] = ["river", "bucket", "feeds", "feedTags", "tags", "extensionTokens"];
+const appSyncClientId = getAppSyncClientId();
+
+function useAppSync(enabled: boolean) {
+  useEffect(() => {
+    if (!enabled) return;
+
+    let socket: WebSocket | null = null;
+    let stopped = false;
+    let reconnectTimer: number | null = null;
+    let flushTimer: number | null = null;
+    let reconnectAttempt = 0;
+    let hasOpened = false;
+    const pendingScopes = new Set<AppSyncScope>();
+
+    function dispatch(scopes: AppSyncScope[]) {
+      const cacheScopes = scopes.filter((scope): scope is CacheTag => scope !== "extensionTokens");
+      if (cacheScopes.length > 0) invalidateCacheTags(cacheScopes);
+      window.dispatchEvent(new CustomEvent<AppSyncScope[]>(appInvalidationEventName, { detail: scopes }));
+    }
+
+    function queueDispatch(scopes: AppSyncScope[]) {
+      for (const scope of scopes) pendingScopes.add(scope);
+      if (flushTimer !== null) return;
+      flushTimer = window.setTimeout(() => {
+        flushTimer = null;
+        const next = Array.from(pendingScopes);
+        pendingScopes.clear();
+        if (next.length > 0) dispatch(next);
+      }, 75);
+    }
+
+    function scheduleReconnect() {
+      if (stopped || reconnectTimer !== null || !navigator.onLine) return;
+      const delay = Math.min(30_000, 500 * 2 ** reconnectAttempt);
+      reconnectAttempt += 1;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, delay);
+    }
+
+    function connect() {
+      if (stopped || !navigator.onLine || socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return;
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      socket = new WebSocket(`${protocol}//${window.location.host}/api/app/live?clientId=${encodeURIComponent(appSyncClientId)}`);
+      socket.addEventListener("open", () => {
+        reconnectAttempt = 0;
+        if (hasOpened) dispatch(allAppSyncScopes);
+        hasOpened = true;
+      });
+      socket.addEventListener("message", (event) => {
+        if (event.data === "pong" || typeof event.data !== "string") return;
+        try {
+          const message = JSON.parse(event.data) as AppInvalidationEvent;
+          if (message.type === "app.invalidate" && Array.isArray(message.scopes)) {
+            queueDispatch(message.scopes.filter(isAppSyncScope));
+          }
+        } catch {
+          // Ignore malformed sync events.
+        }
+      });
+      socket.addEventListener("close", scheduleReconnect);
+      socket.addEventListener("error", () => socket?.close());
+    }
+
+    function reconcileIfDisconnected() {
+      if (socket?.readyState === WebSocket.OPEN) return;
+      dispatch(allAppSyncScopes);
+      connect();
+    }
+
+    function onVisibilityChange() {
+      if (!document.hidden) reconcileIfDisconnected();
+    }
+
+    connect();
+    window.addEventListener("online", reconcileIfDisconnected);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      stopped = true;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      if (flushTimer !== null) window.clearTimeout(flushTimer);
+      window.removeEventListener("online", reconcileIfDisconnected);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      socket?.close(1000, "App closed");
+    };
+  }, [enabled]);
+}
+
+function useAppInvalidation(scopes: AppSyncScope[], callback: () => void) {
+  const callbackRef = useRef(callback);
+  callbackRef.current = callback;
+  const scopeKey = scopes.join("\u0000");
+
+  useEffect(() => {
+    const wanted = new Set(scopes);
+    function onInvalidation(event: Event) {
+      const changed = (event as CustomEvent<AppSyncScope[]>).detail || [];
+      if (changed.some((scope) => wanted.has(scope))) callbackRef.current();
+    }
+    window.addEventListener(appInvalidationEventName, onInvalidation);
+    return () => window.removeEventListener(appInvalidationEventName, onInvalidation);
+  }, [scopeKey]);
+}
+
+function useCoalescedAsync(callback: () => Promise<unknown>): () => void {
+  const callbackRef = useRef(callback);
+  const runningRef = useRef(false);
+  const pendingRef = useRef(false);
+  const mountedRef = useRef(true);
+  callbackRef.current = callback;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  return React.useCallback(() => {
+    if (runningRef.current) {
+      pendingRef.current = true;
+      return;
+    }
+    runningRef.current = true;
+    void (async () => {
+      try {
+        do {
+          pendingRef.current = false;
+          await callbackRef.current();
+        } while (mountedRef.current && pendingRef.current);
+      } catch (error) {
+        console.error(error);
+      } finally {
+        runningRef.current = false;
+      }
+    })();
+  }, []);
+}
+
+function getAppSyncClientId(): string {
+  const key = "riverbucket:sync-client-id";
+  try {
+    const existing = sessionStorage.getItem(key);
+    if (existing) return existing;
+    const created = crypto.randomUUID();
+    sessionStorage.setItem(key, created);
+    return created;
+  } catch {
+    return crypto.randomUUID();
+  }
+}
+
+function isAppSyncScope(value: unknown): value is AppSyncScope {
+  return typeof value === "string" && allAppSyncScopes.includes(value as AppSyncScope);
+}
+
 function App() {
   const [authed, setAuthed] = useState<boolean | null>(null);
   const route = useHashRoute();
   const tab = routeTab(route);
   const appToneClass = appToneForTab(tab);
   const tagline = React.useMemo(() => TAGLINES[Math.floor(Math.random() * TAGLINES.length)], []);
+  useAppSync(authed === true);
 
   useEffect(() => {
     let cancelled = false;
@@ -516,8 +681,12 @@ function River({ route }: { route: Extract<Route, { view: "river" }> }) {
   const [liveStatus, setLiveStatus] = useState(() => initialCache && !initialCache.fresh ? "Updating river..." : "");
   const [message, setMessage] = useState("");
   const [refreshingAll, setRefreshingAll] = useState(false);
+  const [draggedFeedId, setDraggedFeedId] = useState<string | null>(null);
+  const [activeDropTarget, setActiveDropTarget] = useState<string | null>(null);
+  const [taggingFeeds, setTaggingFeeds] = useState<Record<string, boolean>>({});
   const loadSeq = useRef(0);
   const refreshPollSeq = useRef(0);
+  const transientMessageTimeout = useRef<number | null>(null);
 
   function applyRiver(data: RiverResponse) {
     setGroups(data.groups);
@@ -579,6 +748,24 @@ function River({ route }: { route: Extract<Route, { view: "river" }> }) {
     load().catch(console.error);
   }, [sort, tag]);
 
+  const reconcileRemote = useCoalescedAsync(() => load(true));
+  useAppInvalidation(["river", "feedTags"], reconcileRemote);
+
+  useEffect(() => {
+    return () => {
+      if (transientMessageTimeout.current !== null) window.clearTimeout(transientMessageTimeout.current);
+    };
+  }, []);
+
+  function setTransientMessage(text: string) {
+    if (transientMessageTimeout.current !== null) window.clearTimeout(transientMessageTimeout.current);
+    setMessage(text);
+    transientMessageTimeout.current = window.setTimeout(() => {
+      setMessage((current) => current === text ? "" : current);
+      transientMessageTimeout.current = null;
+    }, 3500);
+  }
+
   async function refreshAll() {
     if (refreshingAll) return;
     const pollSeq = ++refreshPollSeq.current;
@@ -633,17 +820,99 @@ function River({ route }: { route: Extract<Route, { view: "river" }> }) {
     return false;
   }
 
+  function dropTargetKey(target: RiverDropTarget): string {
+    return target.kind === "untagged" ? "untagged" : `tag:${target.name}`;
+  }
+
+  function allowFeedDrop(event: React.DragEvent, target: RiverDropTarget) {
+    if (!draggedFeedId) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    setActiveDropTarget(dropTargetKey(target));
+  }
+
+  function leaveFeedDrop(event: React.DragEvent, target: RiverDropTarget) {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setActiveDropTarget((current) => current === dropTargetKey(target) ? null : current);
+    }
+  }
+
+  async function dropFeedOnTarget(event: React.DragEvent, target: RiverDropTarget) {
+    event.preventDefault();
+    const feedId = event.dataTransfer.getData("application/x-riverbucket-feed") || draggedFeedId;
+    setDraggedFeedId(null);
+    setActiveDropTarget(null);
+    if (!feedId) return;
+    const group = groups.find((item) => item.feed.id === feedId);
+    if (!group || taggingFeeds[feedId]) return;
+
+    const feed = group.feed;
+    const currentTags = normalizeTags(feed.tags || []);
+    if (target.kind === "tag" && currentTags.includes(target.name)) {
+      setTransientMessage(`${feed.title} already has ${target.name}.`);
+      return;
+    }
+    if (target.kind === "untagged" && currentTags.length === 0) {
+      setTransientMessage(`${feed.title} is already untagged.`);
+      return;
+    }
+
+    setTaggingFeeds((current) => ({ ...current, [feedId]: true }));
+    setMessage(target.kind === "untagged" ? `Clearing tags from ${feed.title}...` : `Tagging ${feed.title} with ${target.name}...`);
+    try {
+      if (target.kind === "untagged") {
+        await api(`/api/feeds/${feed.id}`, { method: "PATCH", body: { tags: [] } });
+      } else {
+        await api("/api/feeds/bulk-tags", { method: "POST", body: { feedIds: [feed.id], tags: [target.name] } });
+      }
+      invalidateCacheTags(["feeds", "river", "feedTags"]);
+      setTransientMessage(target.kind === "untagged" ? `Cleared tags from ${feed.title}.` : `Tagged ${feed.title} with ${target.name}.`);
+      await Promise.all([load(true), warmDefaultRiverCache()]);
+    } catch (err) {
+      setTransientMessage(err instanceof Error ? err.message : "Failed to update feed tags.");
+    } finally {
+      setTaggingFeeds((current) => {
+        const next = { ...current };
+        delete next[feedId];
+        return next;
+      });
+    }
+  }
+
   return (
     <main className="page">
       <section className="toolbar">
         <div className="segments tagTabs">
           <button className={tag === "all" ? "active" : ""} onClick={() => navigateToRoute({ view: "river", tag: "all", sort })}>All</button>
           {feedTags.map((item) => (
-            <button key={item.id} className={tag === item.name ? "active" : ""} onClick={() => navigateToRoute({ view: "river", tag: item.name, sort })}>
+            <button
+              key={item.id}
+              className={[
+                tag === item.name ? "active" : "",
+                draggedFeedId ? "dropReady" : "",
+                activeDropTarget === `tag:${item.name}` ? "dropActive" : ""
+              ].filter(Boolean).join(" ")}
+              onClick={() => navigateToRoute({ view: "river", tag: item.name, sort })}
+              onDragOver={(event) => allowFeedDrop(event, { kind: "tag", name: item.name })}
+              onDragEnter={(event) => allowFeedDrop(event, { kind: "tag", name: item.name })}
+              onDragLeave={(event) => leaveFeedDrop(event, { kind: "tag", name: item.name })}
+              onDrop={(event) => void dropFeedOnTarget(event, { kind: "tag", name: item.name })}
+            >
               {item.name} <span>{item.feed_count}</span>
             </button>
           ))}
-          <button className={tag === "untagged" ? "active" : ""} onClick={() => navigateToRoute({ view: "river", tag: "untagged", sort })}>Untagged</button>
+          <button
+            className={[
+              tag === "untagged" ? "active" : "",
+              draggedFeedId ? "dropReady" : "",
+              activeDropTarget === "untagged" ? "dropActive" : ""
+            ].filter(Boolean).join(" ")}
+            onClick={() => navigateToRoute({ view: "river", tag: "untagged", sort })}
+            onDragOver={(event) => allowFeedDrop(event, { kind: "untagged" })}
+            onDragEnter={(event) => allowFeedDrop(event, { kind: "untagged" })}
+            onDragLeave={(event) => leaveFeedDrop(event, { kind: "untagged" })}
+            onDrop={(event) => void dropFeedOnTarget(event, { kind: "untagged" })}
+          >Untagged</button>
         </div>
       </section>
       <section className="toolbar">
@@ -672,10 +941,38 @@ function River({ route }: { route: Extract<Route, { view: "river" }> }) {
           const isExpanded = Boolean(expanded[feed.id]);
           const visible = isExpanded ? items.slice(0, 10) : items.slice(0, 5);
           const feedHref = safeHref(feed.site_url || feed.feed_url);
+          const tagging = Boolean(taggingFeeds[feed.id]);
+          const riverFeedClassName = [
+            "riverFeed",
+            draggedFeedId === feed.id ? "dragging" : "",
+            tagging ? "tagging" : ""
+          ].filter(Boolean).join(" ");
           return (
-            <section className="riverFeed" key={feed.id}>
+            <section className={riverFeedClassName} key={feed.id} aria-busy={tagging}>
               <div className="riverFeedMain">
                 <header className="riverFeedHeader">
+                  <button
+                    type="button"
+                    className="riverDragHandle"
+                    draggable={!tagging}
+                    title={`Drag ${feed.title} to a tag`}
+                    aria-label={`Drag ${feed.title} to a tag`}
+                    onDragStart={(event) => {
+                      event.dataTransfer.effectAllowed = "copy";
+                      event.dataTransfer.setData("application/x-riverbucket-feed", feed.id);
+                      event.dataTransfer.setData("text/plain", feed.title);
+                      setRiverFeedDragImage(event, feed);
+                      setDraggedFeedId(feed.id);
+                      setActiveDropTarget(null);
+                    }}
+                    onDragEnd={() => {
+                      setDraggedFeedId(null);
+                      setActiveDropTarget(null);
+                    }}
+                    disabled={tagging}
+                  >
+                    <GripVertical size={14} aria-hidden="true" />
+                  </button>
                   <RiverIcon feed={feed} />
                   {feedHref ? (
                     <a className="riverFeedTitle" href={feedHref} target="_blank" rel="noreferrer">{feed.title}</a>
@@ -719,17 +1016,48 @@ function River({ route }: { route: Extract<Route, { view: "river" }> }) {
   );
 }
 
+function setRiverFeedDragImage(event: React.DragEvent, feed: Feed) {
+  const preview = document.createElement("div");
+  preview.className = "riverDragPreview";
+
+  const title = document.createElement("strong");
+  title.textContent = feed.title;
+  preview.appendChild(title);
+
+  const source = document.createElement("span");
+  source.textContent = domain(feed.site_url || feed.feed_url);
+  preview.appendChild(source);
+
+  document.body.appendChild(preview);
+  const rect = preview.getBoundingClientRect();
+  event.dataTransfer.setDragImage(preview, Math.min(28, rect.width / 2), Math.min(20, rect.height / 2));
+  window.setTimeout(() => preview.remove(), 0);
+}
+
 function BrandLoading({ text }: { text: string }) {
+  const startupLoading = text === "Loading Riverbucket...";
   return (
     <div className="brandLoading" role="status" aria-live="polite">
       <img className="brandLoadingLogo" src="/brand/riverbucket-logo.png" alt="" />
-      <p>{text}</p>
+      {startupLoading ? (
+        <p className="brandLoadingTitle">
+          <span>Loading </span>
+          <span className="river">River</span>
+          <span className="bucket">bucket</span>
+          <span>...</span>
+        </p>
+      ) : (
+        <p>{text}</p>
+      )}
     </div>
   );
 }
 
 function RiverIcon({ feed }: { feed: Feed }) {
   const [showImage, setShowImage] = useState(Boolean(feed.favicon_url));
+  useEffect(() => {
+    setShowImage(Boolean(feed.favicon_url));
+  }, [feed.favicon_url]);
   return (
     <div className="riverIcon" aria-hidden="true">
       {showImage && feed.favicon_url ? (
@@ -744,6 +1072,9 @@ function RiverIcon({ feed }: { feed: Feed }) {
 function RiverInlineItem({ item }: { item: FeedItem }) {
   const [saved, setSaved] = useState(Boolean(item.saved_id));
   const href = safeHref(item.url);
+  useEffect(() => {
+    setSaved(Boolean(item.saved_id));
+  }, [item.saved_id]);
   async function save() {
     const result = await api<{ bookmark: Bookmark }>(`/api/feed-items/${item.id}/save`, { method: "POST" });
     setSaved(true);
@@ -851,6 +1182,9 @@ function Bucket({ route }: { route: Extract<Route, { view: "bucket" }> }) {
     load().catch(console.error);
   }, [status, tag, route.query, page]);
 
+  const reconcileRemote = useCoalescedAsync(() => load(true, { background: true }));
+  useAppInvalidation(["bucket", "tags"], reconcileRemote);
+
   useEffect(() => {
     const interval = window.setInterval(() => {
       if (document.hidden) return;
@@ -873,7 +1207,7 @@ function Bucket({ route }: { route: Extract<Route, { view: "bucket" }> }) {
   async function saveManual(event: FormEvent) {
     event.preventDefault();
     const result = await api<BookmarkSaveResponse>("/api/bookmarks", { method: "POST", body: { url, title } });
-    invalidateCacheTags(["bucket", "tags"]);
+    invalidateCacheTags(["river", "bucket", "tags"]);
     setUrl("");
     setTitle("");
     if (page !== 1) {
@@ -983,7 +1317,7 @@ function Bucket({ route }: { route: Extract<Route, { view: "bucket" }> }) {
     try {
       const path = endpoint === "delete" ? `/api/bookmarks/${bookmark.id}` : `/api/bookmarks/${bookmark.id}/${endpoint}`;
       await api(path, { method: endpoint === "delete" ? "DELETE" : "POST" });
-      invalidateCacheTags(["bucket", "tags"]);
+      invalidateCacheTags(endpoint === "delete" ? ["river", "bucket", "tags"] : ["bucket", "tags"]);
       scheduleRowTimer(() => {
         removeBookmarkLocally(bookmark.id);
         setRowAction(bookmark.id, null);
@@ -1201,6 +1535,9 @@ function Feeds() {
   useEffect(() => {
     load().catch(console.error);
   }, []);
+
+  const reconcileRemote = useCoalescedAsync(() => load(true));
+  useAppInvalidation(["feeds", "feedTags"], reconcileRemote);
 
   async function add(event: FormEvent, feedUrl = url) {
     event.preventDefault();
@@ -1542,10 +1879,11 @@ function FeedTagEditor({
   const savedKey = savedTags.join("\u0000");
 
   useEffect(() => {
-    setTags(savedTags);
-    setDraft("");
-    setEditing(false);
-  }, [savedKey]);
+    if (!editing) {
+      setTags(savedTags);
+      setDraft("");
+    }
+  }, [savedKey, editing]);
 
   useEffect(() => {
     if (editing) inputRef.current?.focus();
@@ -1742,7 +2080,7 @@ function ImportExport() {
       }
       const ignored = totals.ignored ? `; ignored ${totals.ignored} invalid` : "";
       setMessage(`Imported ${totals.imported}/${bookmarks.length} bookmarks; skipped ${totals.skipped} duplicates${ignored}.`);
-      invalidateCacheTags(["bucket", "tags"]);
+      invalidateCacheTags(["river", "bucket", "tags"]);
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "Bookmark import failed.");
     } finally {
@@ -1925,6 +2263,8 @@ function Settings({ onLogout }: { onLogout: () => void }) {
   useEffect(() => {
     load().catch(console.error);
   }, []);
+  const reconcileRemote = useCoalescedAsync(load);
+  useAppInvalidation(["extensionTokens"], reconcileRemote);
 
   async function createToken(event: FormEvent) {
     event.preventDefault();
@@ -2022,10 +2362,14 @@ const memoryApiCache = new Map<string, CacheRecord<unknown>>();
 let apiCacheGeneration = 0;
 
 async function api<T>(path: string, options: ApiOptions = {}): Promise<T> {
+  const method = options.method || "GET";
+  const headers: Record<string, string> = {};
+  if (options.body) headers["content-type"] = "application/json";
+  if (method !== "GET" && method !== "HEAD") headers["x-riverbucket-client-id"] = appSyncClientId;
   const response = await fetch(path, {
-    method: options.method || "GET",
+    method,
     credentials: "include",
-    headers: options.body ? { "content-type": "application/json" } : undefined,
+    headers,
     body: options.body ? JSON.stringify(options.body) : undefined
   });
   const contentType = response.headers.get("content-type") || "";
