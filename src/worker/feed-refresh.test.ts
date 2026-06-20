@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { getDueFeedClaimOrderBy, selectFeedItemsForRefresh } from "./index";
+import {
+  getDueFeedClaimOrderBy,
+  riverQueryFeedBatchSize,
+  savedFeedItemLookupQuery,
+  selectFeedItemsForRefresh
+} from "./index";
 
 function item(id: string, publishedAt?: string) {
   return {
@@ -60,5 +65,22 @@ describe("dueFeedClaimOrderBy", () => {
     expect(latestItemIndex).toBeGreaterThan(-1);
     expect(fallbackIndex).toBeGreaterThan(-1);
     expect(latestItemIndex).toBeLessThan(fallbackIndex);
+  });
+});
+
+describe("savedFeedItemLookupQuery", () => {
+  it("uses one parameter per feed and stays within D1's parameter limit", () => {
+    const query = savedFeedItemLookupQuery(riverQueryFeedBatchSize);
+
+    expect(query.match(/\?/g)).toHaveLength(riverQueryFeedBatchSize);
+    expect(riverQueryFeedBatchSize).toBeLessThanOrEqual(100);
+  });
+
+  it("matches saved items by source item ID and exact URL", () => {
+    const query = savedFeedItemLookupQuery(1);
+
+    expect(query).toContain("source_bookmark.source_feed_item_id = selected_items.id");
+    expect(query).toContain("url_bookmark.url = selected_items.url");
+    expect(query).toContain("COALESCE(source_bookmark.id, url_bookmark.id)");
   });
 });

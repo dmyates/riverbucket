@@ -787,7 +787,7 @@ async function buildRiver(request: Request, env: Env): Promise<RiverResponse> {
   ]);
   const allItems = Array.from(itemsByFeed.values()).flat();
   for (const item of allItems) normalizeFeedItemRecord(item);
-  const savedIds = await getSavedFeedItemIds(env, allItems);
+  const savedIds = await getSavedFeedItemIds(env, feedIds);
   for (const item of allItems) item.saved_id = savedIds.get(item.id) || savedIds.get(item.url) || null;
 
   const output = feedRows.map((feed) => ({ feed, items: itemsByFeed.get(feed.id) || [] }));
@@ -2272,31 +2272,38 @@ async function getRecentFeedItemsMap(env: Env, feedIds: string[], limitPerFeed: 
   return output;
 }
 
-async function getSavedFeedItemIds(env: Env, items: FeedItem[]): Promise<Map<string, string>> {
+export const riverQueryFeedBatchSize = 90;
+
+export function savedFeedItemLookupQuery(feedCount: number): string {
+  const placeholders = Array.from({ length: feedCount }, () => "?").join(", ");
+  return `WITH selected_items AS (
+      SELECT id, url
+      FROM feed_items
+      WHERE feed_id IN (${placeholders})
+    )
+    SELECT selected_items.id AS feed_item_id,
+           selected_items.url AS feed_item_url,
+           COALESCE(source_bookmark.id, url_bookmark.id) AS bookmark_id
+    FROM selected_items
+    LEFT JOIN bookmarks source_bookmark
+      ON source_bookmark.source_feed_item_id = selected_items.id
+     AND source_bookmark.status != 'deleted'
+    LEFT JOIN bookmarks url_bookmark
+      ON url_bookmark.url = selected_items.url
+     AND url_bookmark.status != 'deleted'
+    WHERE source_bookmark.id IS NOT NULL OR url_bookmark.id IS NOT NULL`;
+}
+
+async function getSavedFeedItemIds(env: Env, feedIds: string[]): Promise<Map<string, string>> {
   const output = new Map<string, string>();
-  const itemIds = Array.from(new Set(items.map((item) => item.id)));
-  const urls = Array.from(new Set(items.map((item) => item.url)));
-
-  for (const ids of chunks(itemIds, 90)) {
-    const placeholders = ids.map(() => "?").join(", ");
-    const rows = await env.DB.prepare(
-      `SELECT source_feed_item_id, id
-       FROM bookmarks
-       WHERE source_feed_item_id IN (${placeholders})
-         AND status != 'deleted'`
-    ).bind(...ids).all<{ source_feed_item_id: string; id: string }>();
-    for (const row of rows.results || []) output.set(row.source_feed_item_id, row.id);
-  }
-
-  for (const values of chunks(urls, 90)) {
-    const placeholders = values.map(() => "?").join(", ");
-    const rows = await env.DB.prepare(
-      `SELECT url, id
-       FROM bookmarks
-       WHERE url IN (${placeholders})
-         AND status != 'deleted'`
-    ).bind(...values).all<{ url: string; id: string }>();
-    for (const row of rows.results || []) output.set(row.url, row.id);
+  for (const ids of chunks(feedIds, riverQueryFeedBatchSize)) {
+    const rows = await env.DB.prepare(savedFeedItemLookupQuery(ids.length))
+      .bind(...ids)
+      .all<{ feed_item_id: string; feed_item_url: string; bookmark_id: string }>();
+    for (const row of rows.results || []) {
+      output.set(row.feed_item_id, row.bookmark_id);
+      output.set(row.feed_item_url, row.bookmark_id);
+    }
   }
 
   return output;

@@ -28,6 +28,7 @@ import "@fontsource/ibm-plex-mono/400.css";
 import "@fontsource/ibm-plex-mono/500.css";
 import "@fontsource-variable/fraunces";
 import "@fontsource/zilla-slab/600.css";
+import { createAsyncRateLimiter } from "./async-rate-limiter";
 import "./styles.css";
 
 type Feed = {
@@ -191,6 +192,7 @@ const riverCacheMs = 5 * 60 * 1000;
 const bucketCacheMs = 10 * 60 * 1000;
 const bucketPageSize = 50;
 const feedsCacheMs = 10 * 60 * 1000;
+const riverRefreshIntervalMs = 10_000;
 
 const TAGLINES = [
   "Watchin' feeds like it's '07.",
@@ -355,6 +357,22 @@ function useCoalescedAsync(callback: () => Promise<unknown>): () => void {
       }
     })();
   }, []);
+}
+
+function useRateLimitedAsync(callback: () => Promise<unknown>, intervalMs: number): () => void {
+  const callbackRef = useRef(callback);
+  const limiterRef = useRef<ReturnType<typeof createAsyncRateLimiter> | null>(null);
+  callbackRef.current = callback;
+
+  if (limiterRef.current === null) {
+    limiterRef.current = createAsyncRateLimiter(() => callbackRef.current(), intervalMs);
+  }
+
+  useEffect(() => {
+    return () => limiterRef.current?.dispose();
+  }, []);
+
+  return React.useCallback(() => limiterRef.current?.trigger(), []);
 }
 
 function getAppSyncClientId(): string {
@@ -748,7 +766,7 @@ function River({ route }: { route: Extract<Route, { view: "river" }> }) {
     load().catch(console.error);
   }, [sort, tag]);
 
-  const reconcileRemote = useCoalescedAsync(() => load(true));
+  const reconcileRemote = useRateLimitedAsync(() => load(true), riverRefreshIntervalMs);
   useAppInvalidation(["river", "feedTags"], reconcileRemote);
 
   useEffect(() => {
@@ -786,36 +804,37 @@ function River({ route }: { route: Extract<Route, { view: "river" }> }) {
         return;
       }
       setMessage(`Refresh queued for ${queued.queued}/${queued.total} feeds. Updating river...`);
-      void pollQueuedRiverRefresh(queued, pollSeq).catch(console.error);
+      await pollQueuedRiverRefresh(queued, pollSeq);
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "Refresh all failed.");
     } finally {
-      setRefreshingAll(false);
+      if (pollSeq === refreshPollSeq.current) setRefreshingAll(false);
     }
   }
 
   async function pollQueuedRiverRefresh(queued: RefreshQueueResult, pollSeq: number): Promise<void> {
-    const completedQuickly = await pollRiverRefresh(8, pollSeq);
+    const completedQuickly = await pollRiverRefresh(6, pollSeq);
     if (pollSeq !== refreshPollSeq.current) return;
     if (completedQuickly) {
       setMessage("");
       return;
     }
     setMessage(`Refresh queued for ${queued.queued}/${queued.total} feeds. Still updating in background.`);
-    const completed = await pollRiverRefresh(60, pollSeq, 10000);
+    const completed = await pollRiverRefresh(54, pollSeq);
     if (pollSeq === refreshPollSeq.current && completed) setMessage("");
   }
 
-  async function pollRiverRefresh(attempts: number, pollSeq: number, intervalMs = 2500): Promise<boolean> {
+  async function pollRiverRefresh(attempts: number, pollSeq: number): Promise<boolean> {
     for (let attempt = 0; attempt < attempts; attempt++) {
-      await sleep(attempt === 0 ? 1000 : intervalMs);
+      await sleep(riverRefreshIntervalMs);
       if (pollSeq !== refreshPollSeq.current) return false;
-      invalidateCacheTags(["river", "feeds", "feedTags", "bucket"]);
-      const [riverData, feedsData] = await Promise.all([
-        load(true),
-        api<{ feeds: Feed[] }>("/api/feeds")
-      ]);
-      if (riverData && !hasActiveRefreshClaims(riverData) && !hasActiveFeedRefreshClaims(feedsData.feeds)) return true;
+      try {
+        const feedsData = await api<{ feeds: Feed[] }>("/api/feeds");
+        reconcileRemote();
+        if (!hasActiveFeedRefreshClaims(feedsData.feeds)) return true;
+      } catch (error) {
+        console.error("Refresh status check failed", error);
+      }
     }
     return false;
   }
@@ -2739,10 +2758,6 @@ async function queueFeedRefresh(feedIds: string[]): Promise<RefreshQueueResult> 
     method: "POST",
     body: { feedIds, async: true }
   });
-}
-
-function hasActiveRefreshClaims(data: RiverResponse): boolean {
-  return data.groups.some(({ feed }) => Boolean(feed.refresh_claimed_at || feed.refresh_claim_id));
 }
 
 function hasActiveFeedRefreshClaims(feeds: Feed[]): boolean {
