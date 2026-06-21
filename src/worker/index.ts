@@ -21,6 +21,8 @@ type AppInvalidationEvent = {
 type FeedRefreshMessage = {
   feedId: string;
   claimId?: string;
+  scheduledBatchId?: string;
+  scheduledAt?: string;
 };
 
 type Feed = {
@@ -59,6 +61,11 @@ type FeedItem = {
   raw_hash: string | null;
   saved_id?: string | null;
 };
+
+type RiverFeedItem = Pick<
+  FeedItem,
+  "id" | "feed_id" | "url" | "title" | "published_at" | "discovered_at" | "saved_id"
+>;
 
 type Bookmark = {
   id: string;
@@ -149,10 +156,10 @@ const standardFeedRefreshMinutes = 60;
 const maxRiverItemsPerFeed = 10;
 const maxFeedRefreshItems = 10;
 const maxCronRefreshEnqueues = 20;
-const maxStartupRefreshEnqueues = 5;
 const maxRefreshBatchSize = 5;
 const maxBookmarkPageSize = 100;
 const refreshClaimTtlMinutes = 15;
+const completedRefreshBatchRetentionDays = 2;
 const dueFeedRefreshWhere = `is_active = 1
        AND (last_fetched_at IS NULL OR datetime(last_fetched_at, '+' || fetch_interval_minutes || ' minutes') <= datetime('now'))`;
 const claimableDueFeedRefreshWhere = `${dueFeedRefreshWhere}
@@ -178,6 +185,10 @@ export function getDueFeedClaimOrderBy(): string {
   return dueFeedClaimOrderBy;
 }
 
+export function scheduledRefreshTimestamp(scheduledTime: number): string {
+  return new Date(scheduledTime).toISOString();
+}
+
 type RefreshBatchResult = {
   refreshed: number;
   inserted: number;
@@ -192,7 +203,7 @@ type RefreshQueueResult = {
 };
 
 type RiverResponse = {
-  groups: Array<{ feed: Feed; items: FeedItem[] }>;
+  groups: Array<{ feed: Feed; items: RiverFeedItem[] }>;
   tags: Array<{ id: string; name: string; feed_count: number }>;
 };
 
@@ -233,8 +244,8 @@ export default {
     return env.ASSETS.fetch(request);
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(refreshDueFeeds(env));
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(refreshDueFeeds(env, scheduledRefreshTimestamp(event.scheduledTime)));
   },
 
   async queue(batch: MessageBatch<FeedRefreshMessage>, env: Env): Promise<void> {
@@ -322,7 +333,7 @@ async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Pro
   }
 
   if (method === "GET" && path === "/api/me") return json({ authenticated: true });
-  if (method === "GET" && path === "/api/startup/river") return startupRiver(request, env, ctx);
+  if (method === "GET" && path === "/api/startup/river") return startupRiver(request, env);
   if (method === "GET" && path === "/api/app/live") return openAppSyncSocket(request, env);
   if (method === "POST" && path === "/api/logout") return logout(request);
 
@@ -749,8 +760,7 @@ async function getRiver(request: Request, env: Env): Promise<Response> {
   return json(await buildRiver(request, env));
 }
 
-async function startupRiver(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  ctx.waitUntil(enqueueDueFeeds(env, maxStartupRefreshEnqueues).catch(console.error));
+async function startupRiver(request: Request, env: Env): Promise<Response> {
   return json({ authenticated: true, river: await buildRiver(request, env) });
 }
 
@@ -786,7 +796,6 @@ async function buildRiver(request: Request, env: Env): Promise<RiverResponse> {
     listFeedTagRows(env)
   ]);
   const allItems = Array.from(itemsByFeed.values()).flat();
-  for (const item of allItems) normalizeFeedItemRecord(item);
   const savedIds = await getSavedFeedItemIds(env, feedIds);
   for (const item of allItems) item.saved_id = savedIds.get(item.id) || savedIds.get(item.url) || null;
 
@@ -804,7 +813,7 @@ async function buildRiver(request: Request, env: Env): Promise<RiverResponse> {
   return { groups: output, tags };
 }
 
-function latestFeedItemTime(items: FeedItem[]): string | null {
+function latestFeedItemTime(items: RiverFeedItem[]): string | null {
   const item = items[0];
   return item ? item.published_at || item.discovered_at : null;
 }
@@ -1555,16 +1564,23 @@ async function extensionSubscribe(request: Request, env: Env): Promise<Response>
   return createFeed(request, env);
 }
 
-async function refreshDueFeeds(env: Env): Promise<void> {
-  const refreshed = await enqueueDueFeeds(env, maxCronRefreshEnqueues);
+async function refreshDueFeeds(env: Env, scheduledAt: string): Promise<void> {
+  await cleanupCompletedRefreshBatches(env);
+  const refreshed = await enqueueDueFeeds(env, maxCronRefreshEnqueues, scheduledAt);
   if (refreshed > 0) console.log(JSON.stringify({ event: "refreshDueFeeds", enqueued: refreshed }));
 }
 
-async function enqueueDueFeeds(env: Env, limit: number): Promise<number> {
+async function enqueueDueFeeds(env: Env, limit: number, scheduledAt?: string): Promise<number> {
   const claimLimit = env.FEED_REFRESH_QUEUE ? limit : Math.min(limit, maxRefreshBatchSize);
-  const messages = await claimDueFeeds(env, claimLimit);
+  let messages = await claimDueFeeds(env, claimLimit);
   if (messages.length === 0) return 0;
-  await publishAppInvalidation(env, ["river", "feeds"]);
+  if (scheduledAt) {
+    const scheduledBatchId = crypto.randomUUID();
+    await createScheduledRefreshBatch(env, scheduledBatchId, scheduledAt, messages);
+    messages = messages.map((message) => ({ ...message, scheduledBatchId, scheduledAt }));
+  } else {
+    await publishAppInvalidation(env, ["river", "feeds"]);
+  }
 
   if (env.FEED_REFRESH_QUEUE) {
     await env.FEED_REFRESH_QUEUE.sendBatch(messages.map((message) => ({ body: message })));
@@ -1573,6 +1589,64 @@ async function enqueueDueFeeds(env: Env, limit: number): Promise<number> {
 
   for (const message of messages) await processFeedRefreshMessage(env, message);
   return messages.length;
+}
+
+async function createScheduledRefreshBatch(
+  env: Env,
+  batchId: string,
+  scheduledAt: string,
+  messages: FeedRefreshMessage[]
+): Promise<void> {
+  const createdAt = now();
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO feed_refresh_batches
+       (id, scheduled_at, total_jobs, completed_jobs, notified_at, created_at)
+       VALUES (?, ?, ?, 0, NULL, ?)`
+    ).bind(batchId, scheduledAt, messages.length, createdAt),
+    ...messages.map((message) =>
+      env.DB.prepare(
+        `INSERT INTO feed_refresh_batch_jobs (batch_id, feed_id, completed_at, completion_token)
+         VALUES (?, ?, NULL, NULL)`
+      ).bind(batchId, message.feedId)
+    )
+  ]);
+}
+
+export async function completeScheduledRefreshJob(env: Env, batchId: string, feedId: string): Promise<boolean> {
+  const completedAt = now();
+  const completionToken = crypto.randomUUID();
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE feed_refresh_batch_jobs
+       SET completed_at = ?, completion_token = ?
+       WHERE batch_id = ? AND feed_id = ? AND completed_at IS NULL`
+    ).bind(completedAt, completionToken, batchId, feedId),
+    env.DB.prepare(
+      `UPDATE feed_refresh_batches
+       SET completed_jobs = completed_jobs + 1
+       WHERE id = ?
+         AND EXISTS (
+           SELECT 1
+           FROM feed_refresh_batch_jobs
+           WHERE batch_id = ? AND feed_id = ? AND completion_token = ?
+         )`
+    ).bind(batchId, batchId, feedId, completionToken),
+    env.DB.prepare(
+      `UPDATE feed_refresh_batches
+       SET notified_at = ?
+       WHERE id = ? AND notified_at IS NULL AND completed_jobs >= total_jobs`
+    ).bind(completedAt, batchId)
+  ]);
+  return results[2].meta.changes > 0;
+}
+
+async function cleanupCompletedRefreshBatches(env: Env): Promise<void> {
+  await env.DB.prepare(
+    `DELETE FROM feed_refresh_batches
+     WHERE notified_at IS NOT NULL
+       AND datetime(created_at, '+${completedRefreshBatchRetentionDays} days') <= datetime('now')`
+  ).run();
 }
 
 async function claimDueFeeds(env: Env, limit: number): Promise<FeedRefreshMessage[]> {
@@ -1604,17 +1678,36 @@ async function claimDueFeeds(env: Env, limit: number): Promise<FeedRefreshMessag
 }
 
 async function processFeedRefreshMessage(env: Env, message: FeedRefreshMessage): Promise<void> {
-  const feed = await env.DB.prepare("SELECT * FROM feeds WHERE id = ? AND is_active = 1").bind(message.feedId).first<Feed>();
-  if (!feed) return;
-  if (message.claimId && feed.refresh_claim_id !== message.claimId) return;
-  if (!message.claimId && feed.refresh_claim_id) return;
-  await refreshOneFeed(env, feed);
+  let terminal = false;
+  try {
+    const feed = await env.DB.prepare("SELECT * FROM feeds WHERE id = ? AND is_active = 1").bind(message.feedId).first<Feed>();
+    if (!feed) {
+      terminal = true;
+      return;
+    }
+    if (message.claimId && feed.refresh_claim_id !== message.claimId) {
+      terminal = true;
+      return;
+    }
+    if (!message.claimId && feed.refresh_claim_id) {
+      terminal = true;
+      return;
+    }
+    await refreshOneFeed(env, feed, undefined, message.scheduledAt);
+    terminal = true;
+  } finally {
+    if (terminal && message.scheduledBatchId) {
+      const completed = await completeScheduledRefreshJob(env, message.scheduledBatchId, message.feedId);
+      if (completed) await publishAppInvalidation(env, ["river", "feeds", "bucket", "tags"]);
+    }
+  }
 }
 
 async function refreshOneFeed(
   env: Env,
   feed: Feed,
-  request?: Request
+  request?: Request,
+  refreshTimestamp?: string
 ): Promise<{ ok: boolean; inserted?: number; error?: string }> {
   try {
     const parsed = await fetchAndParseFeed(feed.feed_url);
@@ -1637,17 +1730,19 @@ async function refreshOneFeed(
     }
     await pruneFeedItems(env, feed.id, maxFeedRefreshItems);
     const faviconUrl = faviconForUrl(parsed.siteUrl || feed.site_url || feed.feed_url);
+    const fetchedAt = refreshTimestamp || now();
     await env.DB.prepare(
       "UPDATE feeds SET title = ?, description = ?, site_url = COALESCE(?, site_url), favicon_url = COALESCE(favicon_url, ?), last_fetched_at = ?, last_success_at = ?, last_error = NULL, refresh_claimed_at = NULL, refresh_claim_id = NULL, updated_at = ? WHERE id = ?"
-    ).bind(parsed.title || feed.title, parsed.description || feed.description, parsed.siteUrl || null, faviconUrl, now(), now(), now(), feed.id).run();
-    await publishAppInvalidation(env, ["river", "feeds", "bucket", "tags"], request);
+    ).bind(parsed.title || feed.title, parsed.description || feed.description, parsed.siteUrl || null, faviconUrl, fetchedAt, fetchedAt, now(), feed.id).run();
+    if (!refreshTimestamp) await publishAppInvalidation(env, ["river", "feeds", "bucket", "tags"], request);
     return { ok: true, inserted };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Refresh failed";
+    const fetchedAt = refreshTimestamp || now();
     await env.DB.prepare("UPDATE feeds SET last_fetched_at = ?, last_error = ?, refresh_claimed_at = NULL, refresh_claim_id = NULL, updated_at = ? WHERE id = ?")
-      .bind(now(), message, now(), feed.id)
+      .bind(fetchedAt, message, now(), feed.id)
       .run();
-    await publishAppInvalidation(env, ["river", "feeds"], request);
+    if (!refreshTimestamp) await publishAppInvalidation(env, ["river", "feeds"], request);
     return { ok: false, error: message };
   }
 }
@@ -2245,23 +2340,28 @@ async function getExistingFeedIds(env: Env, feedIds: string[]): Promise<string[]
   return output;
 }
 
-async function getRecentFeedItemsMap(env: Env, feedIds: string[], limitPerFeed: number): Promise<Map<string, FeedItem[]>> {
-  const output = new Map<string, FeedItem[]>();
+export function recentFeedItemsQuery(feedCount: number): string {
+  const placeholders = Array.from({ length: feedCount }, () => "?").join(", ");
+  return `SELECT id, feed_id, url, title, published_at, discovered_at
+    FROM (
+      SELECT id, feed_id, url, title, published_at, discovered_at,
+             ROW_NUMBER() OVER (
+               PARTITION BY feed_id
+               ORDER BY COALESCE(published_at, discovered_at) DESC
+             ) AS row_number
+      FROM feed_items
+      WHERE feed_id IN (${placeholders})
+    )
+    WHERE row_number <= ?`;
+}
+
+async function getRecentFeedItemsMap(env: Env, feedIds: string[], limitPerFeed: number): Promise<Map<string, RiverFeedItem[]>> {
+  const output = new Map<string, RiverFeedItem[]>();
   for (const id of feedIds) output.set(id, []);
   for (const ids of chunks(feedIds, 90)) {
-    const placeholders = ids.map(() => "?").join(", ");
-    const rows = await env.DB.prepare(
-      `SELECT id, feed_id, guid, url, canonical_url, title, author, published_at, discovered_at, summary, raw_hash
-       FROM (
-         SELECT fi.*, ROW_NUMBER() OVER (
-           PARTITION BY feed_id
-           ORDER BY COALESCE(published_at, discovered_at) DESC
-         ) AS row_number
-         FROM feed_items fi
-         WHERE feed_id IN (${placeholders})
-       )
-       WHERE row_number <= ?`
-    ).bind(...ids, limitPerFeed).all<FeedItem>();
+    const rows = await env.DB.prepare(recentFeedItemsQuery(ids.length))
+      .bind(...ids, limitPerFeed)
+      .all<RiverFeedItem>();
     for (const item of rows.results || []) {
       output.get(item.feed_id)?.push(item);
     }
